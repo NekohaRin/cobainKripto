@@ -82,14 +82,27 @@
           <p class="msg" id="msgReg"></p>
         </div>
         <div class="card">
-          <h3>Login Pemilih (3 faktor)</h3>
-          <div class="row">
-            <button class="go alt" id="btnPickKey">
-              1. Pilih dongle .key dari flashdisk
-            </button><span
-              class="mut"
-              id="dongleName"
-            ></span>
+          <h3>Login Pemilih (3 faktor - Otomatis dari USB)</h3>
+          <div class="row" style="align-items: center; gap: 10px">
+            <div
+              id="usbIndicator"
+              style="padding: 8px 12px; border-radius: 6px; background: #1e293b; border: 1px solid #334155; flex-grow: 1; font-size: 0.95em"
+            >
+              <span id="usbIcon"></span>
+              <span id="usbStatusText">Mencari USB Dongle...</span>
+            </div>
+            <button class="go alt" id="btnScanUsb" type="button" style="white-space: nowrap">Periksa USB</button>
+          </div>
+          <div class="row" id="devVoterCodeRow" style="margin-top:8px;display:none">
+            <input
+              id="loginVoterCode"
+              class="pw"
+              type="text"
+              maxlength="7"
+              placeholder="Kode Pemilih (Dev: Vxxxxxx)"
+              autocomplete="off"
+              oninput="if(window.__devDongleUpdate)window.__devDongleUpdate(this.value)"
+            />
           </div>
           <div class="row" style="margin-top: 8px">
             <input
@@ -100,7 +113,7 @@
               maxlength="4"
               placeholder="2. PIN"
               autocomplete="off"
-            /><button class="go" id="btnLogin">
+            /><button class="go" id="btnLogin" disabled>
               3. Pindai wajah &amp; masuk
             </button>
           </div>
@@ -108,17 +121,13 @@
         </div>
         <div class="card">
           <h3>Akses Panitia</h3>
+          <p class="mut" id="adminUsbStatus" style="font-size:13px;margin-bottom:8px">Mencari dongle-ADMIN.key...</p>
           <div class="row">
-            <button class="go alt" id="btnPickAdminKey">
-              1. Pilih dongle panitia
-            </button><span class="mut" id="adminDongleName"></span>
-          </div>
-          <div class="row" style="margin-top: 8px">
             <input
               id="adminKey"
               class="pw"
               type="text"
-              placeholder="2. Kunci panitia"
+              placeholder="Kunci panitia"
               autocomplete="off"
             /><button class="go" id="btnAdmin">Masuk sebagai panitia</button>
           </div>
@@ -346,5 +355,38 @@
     <script src="js/dongle.js"></script>
     <script src="js/file-crypto.js"></script>
     <script src="js/app.js"></script>
+    <script>
+      // Polling USB status: hanya bereaksi jika sesi pemilih aktif dan USB-nya dicabut (HTTP 423).
+      // Tamu dan panitia tidak terkena lock ini.
+      (() => {
+        const lockScreen = () => {
+          document.documentElement.innerHTML = `<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sesi Terkunci</title><style>body{font:16px system-ui;background:#101827;color:#eef2ff;display:grid;min-height:100vh;place-items:center;margin:0}.box{max-width:520px;padding:32px;border:1px solid #334155;border-radius:16px;background:#182235;text-align:center}h1{font-size:24px}.muted{color:#aab6ca}</style></head><body><main class="box"><h1>USB Dongle Dicabut</h1><p>USB security dongle pemilih telah dicabut dari komputer.</p><p class="muted">Sesi telah diakhiri demi kerahasiaan suara.</p><button onclick="location.reload()" style="margin-top:16px;padding:8px 16px;border-radius:6px;cursor:pointer;background:#1e3a5f;color:#eef2ff;border:none">Kembali ke Halaman Utama</button></main></body>`;
+        };
+        const check = async () => {
+          // Kirim Authorization jika sesi voter atau admin sedang aktif
+          const tok = window.__CURRENT_VOTER_SESSION;
+          if (!tok) return; // tamu: skip pengecekan
+          try {
+            const res = await fetch('/api/usb-status', {
+              headers: { 'Authorization': 'Bearer ' + tok },
+              cache: 'no-store'
+            });
+            if (res.status === 423) {
+              console.warn('[USB] lockScreen dipanggil — dongle dicabut (HTTP 423).');
+              lockScreen();
+            } else if (res.ok) {
+              // Jika sesi aktif tapi server anggap tamu, berarti sesi sudah dihapus
+              // (misalnya background watcher sudah hapus sesi lebih dulu)
+              const j = await res.json();
+              if (j.role === 'guest') {
+                console.warn('[USB] lockScreen dipanggil — sesi tidak ditemukan di server (role=guest).');
+                lockScreen();
+              }
+            }
+          } catch (_) {}
+        };
+        setInterval(check, 2000);
+      })();
+    </script>
   </body>
 </html>

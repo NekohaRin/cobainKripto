@@ -3,31 +3,30 @@ const express = require("express"),
   mysql = require("mysql2/promise"),
   crypto = require("crypto"),
   path = require("path"),
-  fs = require("fs");
+  fs = require("fs"),
+  { execFile } = require("child_process"),
+  { promisify } = require("util");
+const execFileAsync = promisify(execFile);
 const Layers = require("../shared/layers"),
   led = require("./ledger");
 const E = process.env;
 if (
   E.NODE_ENV === "production" &&
-  ["ADMIN_KEY", "ELECTION_SECRET", "NIK_SALT", "FACE_KEY"].some((k) => !E[k])
+  ["ADMIN_KEY", "ELECTION_SECRET", "NIK_SALT", "FACE_KEY", "ADMIN_TOKEN_HASH", "ADMIN_USB_SERIAL"].some((k) => !E[k])
 ) {
-  console.error("Isi ADMIN_KEY, ELECTION_SECRET, NIK_SALT, FACE_KEY di .env");
+  console.error("Isi ADMIN_KEY, ELECTION_SECRET, NIK_SALT, FACE_KEY, ADMIN_TOKEN_HASH, ADMIN_USB_SERIAL di .env");
   process.exit(1);
 }
 const SECRET = E.ELECTION_SECRET || "dev-secret",
   BLOCK = +E.BLOCK_SIZE || 3,
   ADMIN_KEY = E.ADMIN_KEY || "dev-admin";
+const LOCKOUT_SECONDS = Number(E.LOCKOUT_SECONDS) || 60;
 const PARAMS = { shift: +E.ELECTION_SHIFT || 7, rails: +E.ELECTION_RAILS || 4 };
 const pool = mysql.createPool({
   host: E.DB_HOST || "localhost",
-  port: +E.DB_PORT || 3306,
   user: E.DB_USER || "root",
   password: E.DB_PASS || "",
   database: E.DB_NAME || "evoting",
-  ssl:
-    E.DB_SSL === "true"
-      ? { minVersion: "TLSv1.2", rejectUnauthorized: true }
-      : undefined,
   connectionLimit: 10,
   timezone: "Z",
 });
@@ -52,13 +51,19 @@ const openFace = (s) => {
   d.setAuthTag(b.subarray(12, 28));
   return JSON.parse(Buffer.concat([d.update(b.subarray(28)), d.final()]));
 };
-const FACE_THRESHOLD = Number(E.FACE_THRESHOLD) || 0.40;
+const FACE_THRESHOLD = Number(E.FACE_THRESHOLD) || 0.5;
+// Threshold untuk cek anti-sybil saat registrasi: lebih ketat (lebih kecil) agar
+// hanya menolak wajah yang benar-benar sama. Jika dua orang berbeda kebetulan
+// menghasilkan jarak ~0.45, threshold login (0.5) akan menganggap mereka sama padahal
+// threshold registrasi yang lebih kecil (0.4) akan membedakan mereka.
+const FACE_REGISTER_THRESHOLD = Number(E.FACE_REGISTER_THRESHOLD) || 0.4;
 const validDesc = (d) =>
   Array.isArray(d) && d.length === 128 && d.every(Number.isFinite);
 
 function faceDistance(a, b) {
   if (!validDesc(a) || !validDesc(b)) return Infinity;
-  let normA = 0, normB = 0;
+  let normA = 0,
+    normB = 0;
   for (let i = 0; i < 128; i++) {
     normA += a[i] * a[i];
     normB += b[i] * b[i];
@@ -69,7 +74,7 @@ function faceDistance(a, b) {
 
   let sumSq = 0;
   for (let i = 0; i < 128; i++) {
-    const diff = (a[i] / normA) - (b[i] / normB);
+    const diff = a[i] / normA - b[i] / normB;
     sumSq += diff * diff;
   }
   return Math.sqrt(sumSq);
@@ -83,23 +88,166 @@ const faceMatch = (a, b, threshold = FACE_THRESHOLD) => {
 const app = express(),
   sessions = new Map(),
   adminFails = new Map();
-  app.set("trust proxy", 1);
-// Dongle (flashdisk) dicek di browser pengguna, bukan di server, sehingga server boleh di-host.
-// Setiap sesi terikat ke token dari berkas .key. Browser wajib membaca berkas itu ulang tiap beberapa
-// detik dan mengirim bukti HMAC(token, nonce) lewat /api/beat. Flashdisk dicabut = bukti berhenti =
-// sesi dicabut server. DONGLE_REQUIRED=false hanya untuk pengembangan.
+
+// Dynamic per-voter USB dongle lock.
+// Aplikasi tidak dikunci secara global; Gatekeeper selalu terbuka.
+// Pemilih yang sedang login dicek terus apakah file .key-nya masih ada di USB.
 const DONGLE_REQUIRED = E.DONGLE_REQUIRED !== "false";
-const DONGLE_TIMEOUT = Math.max(3000, Number(E.DONGLE_TIMEOUT_MS) || 8000);
-const ADMIN_DONGLE_HASH = (E.ADMIN_DONGLE_HASH || "").toLowerCase();
-const hmac = (key, msg) =>
-  crypto.createHmac("sha256", key).update(msg).digest("hex");
-const nonce = () => crypto.randomBytes(16).toString("hex");
-const dongleFields = (dk) =>
-  DONGLE_REQUIRED ? { dk, nonce: nonce(), beat: Date.now() } : {};
-const alive = (s) =>
-  !!s &&
-  s.exp > Date.now() &&
-  (!DONGLE_REQUIRED || (s.dk && Date.now() - s.beat <= DONGLE_TIMEOUT));
+
+// Memindai seluruh drive bertipe USB (Removable) yang terpasang dan siap di Windows.
+async function getConnectedUsbDrives() {
+  if (process.platform !== "win32") return [];
+  const ps =
+    "[System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType.ToString() -eq 'Removable' -and $_.IsReady } | ForEach-Object { [pscustomobject]@{ DriveLetter=$_.Name.Substring(0,2) } } | ConvertTo-Json -Compress";
+  try {
+    const { stdout } = await execFileAsync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        ps,
+      ],
+      { windowsHide: true, timeout: 4000, maxBuffer: 1024 * 1024 },
+    );
+    if (!stdout.trim()) return [];
+    const parsed = JSON.parse(stdout.trim());
+    const drives = Array.isArray(parsed) ? parsed : [parsed];
+    return drives
+      .map((d) => String(d.DriveLetter || "").toUpperCase())
+      .filter((d) => /^[A-Z]:$/.test(d));
+  } catch (err) {
+    console.error("Gagal mendeteksi USB drives:", err.message);
+    return null; // null = error saat scan; [] = tidak ada USB; dibedakan agar watcher tidak false-revoke
+  }
+}
+
+// Membaca serial number semua USB yang tertancap via Get-Disk (Windows only).
+// Dipakai untuk verifikasi serial admin USB di production.
+async function getUsbSerials() {
+  if (process.platform !== "win32") return [];
+  const ps = "Get-Disk | Where-Object { $_.BusType -eq 'USB' } | Select-Object -ExpandProperty SerialNumber | ConvertTo-Json -Compress";
+  try {
+    const { stdout } = await execFileAsync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps],
+      { windowsHide: true, timeout: 4000, maxBuffer: 1024 * 1024 },
+    );
+    if (!stdout.trim()) return [];
+    const parsed = JSON.parse(stdout.trim());
+    const serials = Array.isArray(parsed) ? parsed : [parsed];
+    return serials.map((s) => String(s).trim()).filter(Boolean);
+  } catch (err) {
+    console.error("Gagal membaca serial USB:", err.message);
+    return [];
+  }
+}
+
+// Memindai berkas dongle-V*.key (voter) dan dongle-ADMIN.key (admin) di semua drive USB.
+// Mengembalikan null jika scan gagal (error PowerShell), [] jika tidak ada dongle ditemukan.
+async function findDonglesOnUsb() {
+  if (!DONGLE_REQUIRED) return [];
+  const usbDrives = await getConnectedUsbDrives();
+  if (usbDrives === null) return null; // propagasi error scan
+  const detected = [];
+  for (const drive of usbDrives) {
+    try {
+      const rootPath = drive + "\\";
+      const files = await fs.promises.readdir(rootPath);
+      for (const file of files) {
+        // Voter dongle: dongle-Vxxxxxx.key
+        if (/^dongle-V\d{6}\.key$/i.test(file)) {
+          try {
+            const raw = await fs.promises.readFile(
+              path.join(rootPath, file),
+              "utf8",
+            );
+            const parsed = JSON.parse(raw);
+            if (
+              parsed &&
+              /^V\d{6}$/.test(parsed.voterCode) &&
+              /^[0-9a-f]{64}$/.test(parsed.token)
+            ) {
+              detected.push({
+                role: "voter",
+                voterCode: parsed.voterCode,
+                token: parsed.token.trim(),
+                nikMask: parsed.nikMask || null,
+                driveLetter: drive,
+                fileName: file,
+              });
+            }
+          } catch (_) {
+            /* Lewati berkas rusak */
+          }
+        }
+        // Admin dongle: dongle-ADMIN.key
+        if (/^dongle-ADMIN\.key$/i.test(file)) {
+          try {
+            const raw = await fs.promises.readFile(
+              path.join(rootPath, file),
+              "utf8",
+            );
+            const parsed = JSON.parse(raw);
+            if (
+              parsed &&
+              parsed.role === "admin" &&
+              /^[0-9a-f]{64}$/.test(parsed.token)
+            ) {
+              detected.push({
+                role: "admin",
+                token: parsed.token.trim(),
+                driveLetter: drive,
+                fileName: file,
+              });
+            }
+          } catch (_) {
+            /* Lewati berkas rusak */
+          }
+        }
+      }
+    } catch (_) {
+      /* Drive tidak dapat diakses */
+    }
+  }
+  return detected;
+}
+
+// Background watcher: revoke sesi voter/admin jika USB-nya dicabut.
+if (DONGLE_REQUIRED) {
+  setInterval(
+    async () => {
+      const activeSessions = Array.from(sessions.entries()).filter(
+        ([_, s]) => s.voterCode || s.adminToken,
+      );
+      if (activeSessions.length === 0) return;
+      const dongles = await findDonglesOnUsb();
+      if (dongles === null) return; // error saat scan — jangan false-revoke sesi aktif
+      for (const [tokenKey, s] of activeSessions) {
+        let exists;
+        if (s.voterCode) {
+          exists = dongles.some(
+            (d) => d.role === "voter" && d.voterCode === s.voterCode && d.token === s.token,
+          );
+        } else {
+          // sesi admin — cek dongle admin masih cocok
+          exists = dongles.some(
+            (d) => d.role === "admin" && eq(sha(d.token), E.ADMIN_TOKEN_HASH || ""),
+          );
+        }
+        if (!exists) {
+          sessions.delete(tokenKey);
+          console.warn(
+            `[SECURITY] USB dongle untuk ${s.voterCode ? "voter " + s.voterCode : "admin"} dicabut. Sesi dibatalkan.`,
+          );
+        }
+      }
+    },
+    Math.max(1000, Number(E.DONGLE_POLL_MS) || 1500),
+  ).unref();
+}
 
 const newSession = (data, ttl) => {
   const t = crypto.randomBytes(24).toString("hex");
@@ -110,16 +258,6 @@ setInterval(
   () => sessions.forEach((s, k) => s.exp < Date.now() && sessions.delete(k)),
   60e3,
 ).unref();
-setInterval(
-  () =>
-    sessions.forEach((s, k) => {
-      if (!alive(s)) {
-        sessions.delete(k);
-        if (s.exp > Date.now()) console.warn("Dongle tidak terbaca: sesi dicabut.");
-      }
-    }),
-  1000,
-).unref();
 let chain = Promise.resolve(); // registrasi diserialkan agar cek wajah ganda tidak bisa dibalap
 const serial = (fn) => {
   const p = chain.then(fn);
@@ -128,14 +266,6 @@ const serial = (fn) => {
 };
 
 app.disable("x-powered-by");
-// Health check untuk Railway
-app.get("/health", (req, res) => {
-  res.status(200).json({
-    status: "ok",
-    application: "E-Voting Cryptography",
-    environment: process.env.NODE_ENV
-  });
-});
 app.use((_, res, next) => {
   res.set({
     "X-Content-Type-Options": "nosniff",
@@ -145,6 +275,8 @@ app.use((_, res, next) => {
   });
   next();
 });
+// Tidak ada global lock — Gatekeeper selalu terbuka.
+// Pemilih dikunci di level sesi (via /api/usb-status) bukan di level halaman.
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.join(__dirname, "../public")));
 app.use("/shared", express.static(path.join(__dirname, "../shared")));
@@ -159,7 +291,7 @@ const auth = (req, res, next) => {
   // khusus pemilih
   const t = (req.headers.authorization || "").replace("Bearer ", ""),
     s = sessions.get(t);
-  if (!alive(s) || s.admin)
+  if (!s || s.admin || s.exp < Date.now())
     return res.status(401).json({ error: "Sesi tidak valid." });
   req.voterId = s.id;
   req.sessionToken = t;
@@ -167,34 +299,65 @@ const auth = (req, res, next) => {
 };
 const admin = (req, res, next) => {
   const s = sess(req);
-  return alive(s) && s.admin
+  return s && s.admin && s.exp > Date.now()
     ? next()
     : res.status(401).json({ error: "Khusus panitia. Login sebagai admin." });
 };
 
-// Bukti kehadiran dongle. Klien membaca berkas .key lalu mengirim HMAC(token, nonce terakhir).
-app.post("/api/beat", (req, res) => {
-  const t = (req.headers.authorization || "").replace("Bearer ", ""),
-    s = sessions.get(t);
-  if (!alive(s)) {
-    sessions.delete(t);
-    return res.status(401).json({ error: "Sesi tidak valid." });
-  }
-  if (DONGLE_REQUIRED) {
-    const proof = req.body && req.body.proof;
-    if (typeof proof !== "string" || !eq(proof, hmac(s.dk, s.nonce))) {
-      sessions.delete(t);
-      return res.status(401).json({ error: "Dongle tidak valid." });
+app.get(
+  "/api/usb-status",
+  wrap(async (req, res) => {
+    const s = sess(req);
+    if (!DONGLE_REQUIRED) {
+      // Bypass USB — kembalikan role dari sesi aktif agar polling tidak false-kick
+      if (s && s.exp > Date.now()) {
+        return res.json({ ok: true, role: s.admin ? "admin" : "voter" });
+      }
+      return res.json({ ok: true, role: "guest" });
     }
-    s.beat = Date.now();
-    s.nonce = nonce();
-  }
-  res.json({ nonce: s.nonce });
-});
-app.post("/api/logout", (req, res) => {
-  sessions.delete((req.headers.authorization || "").replace("Bearer ", ""));
-  res.json({ ok: true });
-});
+    const sessionKey = (req.headers.authorization || "").replace("Bearer ", "");
+    // Pemilih aktif: pastikan USB dengan token-nya masih tertancap
+    if (s && s.voterCode && s.exp > Date.now()) {
+      const dongles = await findDonglesOnUsb();
+      if (dongles === null) return res.json({ ok: true, role: "voter" }); // error scan — jangan false-revoke
+      const stillAttached = dongles.some(
+        (d) => d.role === "voter" && d.voterCode === s.voterCode && d.token === s.token,
+      );
+      if (!stillAttached) {
+        sessions.delete(sessionKey);
+        return res.status(423).json({ error: "USB dongle pemilih dicabut." });
+      }
+      return res.json({ ok: true, role: "voter" });
+    }
+    // Panitia aktif: pastikan dongle-ADMIN.key masih tertancap
+    if (s && s.admin && s.adminToken && s.exp > Date.now()) {
+      const dongles = await findDonglesOnUsb();
+      if (dongles === null) return res.json({ ok: true, role: "admin" }); // error scan — jangan false-revoke
+      const stillAttached = dongles.some(
+        (d) => d.role === "admin" && eq(sha(d.token), E.ADMIN_TOKEN_HASH || ""),
+      );
+      if (!stillAttached) {
+        sessions.delete(sessionKey);
+        return res.status(423).json({ error: "USB dongle panitia dicabut." });
+      }
+      return res.json({ ok: true, role: "admin" });
+    }
+    // Tamu / belum login: tidak dikunci (Gatekeeper terbuka)
+    res.json({ ok: true, role: "guest" });
+  }),
+);
+
+// Deteksi otomatis dongle-V*.key (voter) dan dongle-ADMIN.key (admin) di semua drive USB.
+app.get(
+  "/api/dongle/detect",
+  wrap(async (_req, res) => {
+    if (!DONGLE_REQUIRED) return res.json({ required: false, detected: [], detectedAdmin: null });
+    const dongles = await findDonglesOnUsb();
+    const voterDongles = dongles ? dongles.filter((d) => d.role === "voter") : [];
+    const adminDongle = dongles ? dongles.find((d) => d.role === "admin") || null : null;
+    res.json({ required: true, detected: voterDongles, detectedAdmin: adminDongle ? true : false });
+  }),
+);
 
 app.get(
   "/api/candidates",
@@ -217,23 +380,22 @@ app.post(
         !validDesc(descriptor)
       )
         return res.status(400).json({ error: "Data tidak valid." });
-      // Anti-Sybil: satu wajah hanya boleh satu NIK (Euclidean normalized <= FACE_THRESHOLD terhadap semua descriptor)
+      // Anti-Sybil: satu wajah hanya boleh satu NIK.
+      // Gunakan FACE_REGISTER_THRESHOLD (lebih kecil dari threshold login) agar
+      // dua orang dengan wajah berbeda tidak saling terblokir satu sama lain.
       const [faces] = await pool.query("SELECT face_enc FROM voters");
       if (
         faces.some((r) => {
           try {
-            return faceMatch(descriptor, openFace(r.face_enc)).ok;
+            return faceMatch(descriptor, openFace(r.face_enc), FACE_REGISTER_THRESHOLD).ok;
           } catch {
             return false;
           }
         })
       )
-        return res
-          .status(400)
-          .json({
-            error:
-              "Wajah ini sudah terdaftar pada NIK lain. Registrasi ditolak.",
-          });
+        return res.status(400).json({
+          error: "Wajah ini sudah terdaftar pada NIK lain. Registrasi ditolak.",
+        });
       const salt = crypto.randomBytes(16).toString("hex"),
         token = crypto.randomBytes(32).toString("hex"),
         code = "V" + crypto.randomInt(100000, 999999);
@@ -263,21 +425,37 @@ app.post(
   "/api/login",
   wrap(async (req, res) => {
     const { voterCode, pin, token, descriptor } = req.body,
-      fail = (msg = "Autentikasi gagal.") => res.status(401).json({ error: msg });
+      fail = () => res.status(401).json({ error: "Autentikasi gagal." });
+    const devBypass = !DONGLE_REQUIRED && E.NODE_ENV !== "production";
     if (
       typeof voterCode !== "string" ||
       typeof pin !== "string" ||
-      typeof token !== "string" ||
       !/^V\d{6}$/.test(voterCode) ||
       !/^\d{4}$/.test(pin) ||
-      !/^[0-9a-f]{64}$/.test(token)
+      (!devBypass && (typeof token !== "string" || !/^[0-9a-f]{64}$/.test(token)))
     )
       return fail();
+
     const [[v]] = await pool.query(
       "SELECT * FROM voters WHERE voter_code = ?",
       [voterCode],
     );
-    if (!v || v.failed_attempts >= 5) return fail();
+    if (!v) return fail();
+
+    // Cek blokir sementara dari DB (epoch ms, timezone-safe)
+    if (v.locked_until_ms && v.locked_until_ms > Date.now()) {
+      const retryAfterSeconds = Math.ceil((v.locked_until_ms - Date.now()) / 1000);
+      return res.status(429).json({ error: "Akun dikunci sementara.", retryAfterSeconds });
+    }
+    // Blokir sudah kedaluwarsa — reset
+    if (v.locked_until_ms) {
+      await pool.query(
+        "UPDATE voters SET failed_attempts = 0, locked_until_ms = NULL WHERE id = ?",
+        [v.id],
+      );
+      v.failed_attempts = 0;
+      v.locked_until_ms = null;
+    }
 
     let storedFace;
     try {
@@ -291,73 +469,113 @@ app.post(
     const faceOk = faceMatched;
 
     console.log(
-      `[AUTH] Login voter ${voterCode}: distance=${isFinite(dist) ? dist.toFixed(4) : dist}, threshold=${FACE_THRESHOLD} -> ${faceOk ? "PASS" : "FAIL"}`
+      `[AUTH] Login voter ${voterCode}: distance=${isFinite(dist) ? dist.toFixed(4) : dist}, threshold=${FACE_THRESHOLD} -> ${faceOk ? "PASS" : "FAIL"}`,
     );
 
     const pinOk = eq(pinHash(pin, v.pin_salt), v.pin_hash);
-    const tokenOk = eq(sha(token), v.token_hash);
+    const tokenOk = devBypass || eq(sha(token), v.token_hash);
 
     if (!pinOk || !tokenOk || !faceOk) {
       await pool.query(
         "UPDATE voters SET failed_attempts = failed_attempts + 1 WHERE id = ?",
         [v.id],
       );
-      if (pinOk && tokenOk && !faceOk) {
-        console.warn(
-          `[AUTH] Login ditolak untuk ${voterCode}: wajah tidak cocok (jarak: ${dist.toFixed(4)} > ${FACE_THRESHOLD}).`
+      const [[updated]] = await pool.query(
+        "SELECT failed_attempts FROM voters WHERE id = ?",
+        [v.id],
+      );
+      const newAttempts = updated?.failed_attempts ?? (v.failed_attempts + 1);
+      console.warn(
+        `[AUTH] Login ditolak untuk ${voterCode}: pin=${pinOk}, token=${tokenOk}, face=${faceOk}${isFinite(dist) ? ` (jarak: ${dist.toFixed(4)})` : ""}. Percobaan ke-${newAttempts}.`,
+      );
+      if (newAttempts >= 5) {
+        const lockUntilMs = Date.now() + LOCKOUT_SECONDS * 1000;
+        await pool.query(
+          "UPDATE voters SET failed_attempts = 0, locked_until_ms = ? WHERE id = ?",
+          [lockUntilMs, v.id],
         );
-        return fail("Wajah tidak cocok dengan data pemilih terdaftar.");
+        console.warn(`[AUTH] Akun ${voterCode} dikunci ${LOCKOUT_SECONDS} detik.`);
+        return res.status(429).json({ error: "Akun dikunci sementara.", retryAfterSeconds: LOCKOUT_SECONDS });
       }
       return fail();
     }
-    await pool.query("UPDATE voters SET failed_attempts = 0 WHERE id = ?", [
-      v.id,
-    ]);
-    const st = newSession({ id: v.id, ...dongleFields(token) }, 15 * 60e3);
+
+    await pool.query(
+      "UPDATE voters SET failed_attempts = 0, locked_until_ms = NULL WHERE id = ?",
+      [v.id],
+    );
     res.json({
-      session: st,
+      session: newSession(
+        { id: v.id, voterCode: v.voter_code, token },
+        15 * 60e3,
+      ),
       hasVoted: !!v.has_voted,
-      nonce: sessions.get(st).nonce,
     });
   }),
 );
 
-app.post("/api/admin/login", (req, res) => {
-  // login panitia: sesi 30 menit, 5 gagal = blok 5 menit per IP
-  const a = adminFails.get(req.ip) || { n: 0, until: 0 };
-  if (a.until > Date.now())
-    return res
-      .status(429)
-      .json({ error: "Terlalu banyak percobaan. Coba lagi beberapa menit." });
-  if (
-    typeof req.body.key !== "string" ||
-    !eq(sha(req.body.key), sha(ADMIN_KEY))
-  ) {
-    if (++a.n >= 5) {
-      a.until = Date.now() + 300e3;
-      a.n = 0;
+app.post(
+  "/api/admin/login",
+  wrap(async (req, res) => {
+    // login panitia: dongle-ADMIN.key di USB + serial USB + kunci teks ADMIN_KEY
+    // sesi 30 menit, 5 gagal = blok 5 menit per IP
+    const failAdmin = () => res.status(401).json({ error: "Autentikasi gagal." });
+    const a = adminFails.get(req.ip) || { n: 0, until: 0 };
+    if (a.until > Date.now())
+      return res.status(429).json({ error: "Terlalu banyak percobaan. Coba lagi beberapa menit." });
+
+    // Cek format kunci
+    if (typeof req.body.key !== "string") {
+      if (++a.n >= 5) { a.until = Date.now() + 300e3; a.n = 0; }
+      adminFails.set(req.ip, a);
+      return failAdmin();
     }
-    adminFails.set(req.ip, a);
-    return res.status(401).json({ error: "Kunci panitia salah." });
-  }
-  if (DONGLE_REQUIRED) {
-    const tk = req.body.token;
-    if (
-      !/^[0-9a-f]{64}$/.test(ADMIN_DONGLE_HASH) ||
-      typeof tk !== "string" ||
-      !/^[0-9a-f]{64}$/.test(tk) ||
-      !eq(sha(tk), ADMIN_DONGLE_HASH)
-    )
-      return res
-        .status(401)
-        .json({ error: "Dongle panitia tidak valid atau belum didaftarkan." });
-  }
-  adminFails.delete(req.ip);
-  const st = newSession(
-    { admin: true, ...dongleFields(req.body.token) },
-    30 * 60e3,
-  );
-  res.json({ session: st, nonce: sessions.get(st).nonce });
+
+    // Server scan USB langsung — cari dongle-ADMIN.key yang valid
+    const dongles = await findDonglesOnUsb();
+    const adminDongle = dongles
+      ? dongles.find(
+          (d) => d.role === "admin" && eq(sha(d.token), E.ADMIN_TOKEN_HASH || ""),
+        )
+      : null;
+
+    // Cek serial USB — hanya di production; di development di-skip untuk kemudahan recovery
+    let serialOk = true;
+    if (E.NODE_ENV === "production" && E.ADMIN_USB_SERIAL) {
+      const usbSerials = await getUsbSerials();
+      serialOk = usbSerials.includes(E.ADMIN_USB_SERIAL.trim());
+    }
+
+    const keyOk = eq(sha(req.body.key), sha(ADMIN_KEY));
+
+    if (!adminDongle || !keyOk || !serialOk) {
+      if (++a.n >= 5) { a.until = Date.now() + 300e3; a.n = 0; }
+      adminFails.set(req.ip, a);
+      console.warn(`[AUTH] Login admin ditolak dari ${req.ip}: dongle=${!!adminDongle}, key=${keyOk}, serial=${serialOk}`);
+      return failAdmin();
+    }
+
+    adminFails.delete(req.ip);
+    res.json({
+      session: newSession({ admin: true, adminToken: adminDongle.token }, 30 * 60e3),
+    });
+  }),
+);
+
+// Generate dongle admin — hanya tersedia di development mode.
+// Buka endpoint ini di browser, unduh file dongle-ADMIN.key, salin ke USB,
+// lalu isi ADMIN_TOKEN_HASH di .env dengan nilai dari header x-token-hash dan restart server.
+app.get("/api/admin/generate-dongle", (req, res) => {
+  if (E.NODE_ENV !== "development")
+    return res.status(404).json({ error: "Tidak tersedia di production." });
+  const token = crypto.randomBytes(32).toString("hex");
+  const tokenHash = sha(token);
+  console.log(`[SETUP] dongle-ADMIN.key di-generate. Isi .env:\nADMIN_TOKEN_HASH=${tokenHash}`);
+  res
+    .set("Content-Disposition", 'attachment; filename="dongle-ADMIN.key"')
+    .set("Content-Type", "application/json")
+    .set("x-token-hash", tokenHash)
+    .json({ role: "admin", token });
 });
 
 app.post(
@@ -395,14 +613,9 @@ app.post(
         await conn.rollback();
         return res.status(409).json({ error: "Anda sudah memilih." });
       }
-      const [upd] = await conn.query(
-        "UPDATE voters SET has_voted = 1 WHERE id = ? AND has_voted = 0",
-        [req.voterId],
-      );
-      if (upd.affectedRows !== 1) {
-        await conn.rollback();
-        return res.status(409).json({ error: "Anda sudah memilih." });
-      }
+      await conn.query("UPDATE voters SET has_voted = 1 WHERE id = ?", [
+        req.voterId,
+      ]);
       await conn.query("INSERT INTO pending_votes (choice_hash) VALUES (?)", [
         led.choiceHash(cid, SECRET),
       ]);
@@ -537,8 +750,6 @@ app.use((err, _req, res, _next) =>
   res.status(400).json({ error: "Permintaan tidak valid." }),
 );
 
-const PORT = Number(process.env.PORT) || 3000;
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`E-Voting server berjalan pada port ${PORT}`);
-});
+app.listen(E.PORT || 3000, () =>
+  console.log("E-Voting server di http://localhost:" + (E.PORT || 3000)),
+);
