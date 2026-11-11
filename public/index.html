@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Classified E-Voting &amp; Campaign Command</title>
+    <link rel="stylesheet" href="css/app.css" />
+    <link rel="stylesheet" href="css/app-additions.css" />
+  </head>
+  <body>
+    <aside>
+      <h1>Classified E-Voting</h1>
+      <nav id="nav">
+        <button data-t="gate">Gatekeeper</button>
+        <button data-t="vote" hidden>Surat Suara</button
+        ><button data-t="status" hidden>Status Pemilih</button>
+        <button data-t="text" hidden>Tactical Command Messaging</button
+        ><button data-t="file" hidden>Campaign Logistical Vault</button>
+        <button data-t="stego" hidden>Anti-Counterfeit Credential</button
+        ><button data-t="dash" hidden>Command Dashboard</button>
+      </nav>
+    </aside>
+    <main>
+      <div class="topbar">
+        <span id="acct">Belum login</span
+        ><button class="go alt" id="btnLogout" data-logout hidden>
+          Logout
+        </button>
+      </div>
+      <div id="toasts" class="toasts" aria-live="polite"></div>
+
+      <section id="gate">
+        <h2>Gatekeeper</h2>
+        <details class="explain" open>
+          <summary>Peran dan fungsi</summary>
+          <p>
+            <b>Pemilih</b>: daftar (NIK + PIN + wajah, dongle .key diunduh
+            otomatis), login 3 faktor (dongle + PIN + wajah), memilih satu kali,
+            lalu melihat halaman Status. Hanya menu Surat Suara dan Status yang
+            terbuka.
+          </p>
+          <p>
+            <b>Panitia (Admin)</b>: masuk dengan Kunci Panitia. Membuka Tactical
+            Command Messaging (pesan perintah 3 lapis), Campaign Logistical
+            Vault (brankas dokumen .secure), Anti-Counterfeit Credential
+            (watermark DCT untuk mendeteksi poster/kartu palsu), dan Command
+            Dashboard (ledger, segel blok, deteksi tamper). Panitia tidak bisa
+            memilih.
+          </p>
+        </details>
+        <div class="card">
+          <h3>Kamera</h3>
+          <div class="cam">
+            <video id="cam" muted playsinline></video
+            ><canvas id="camOverlay"></canvas>
+          </div>
+          <div class="row" style="margin-top: 8px">
+            <button class="go alt" id="btnCam">Nyalakan kamera</button>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Daftar pemilih baru</h3>
+          <div class="row">
+            <input
+              id="regNik"
+              inputmode="numeric"
+              maxlength="16"
+              placeholder="NIK 16 digit"
+              autocomplete="off"
+            /><input
+              id="regPin"
+              class="pw"
+              type="text"
+              inputmode="numeric"
+              maxlength="4"
+              placeholder="PIN 4 digit"
+              autocomplete="off"
+            /><button class="go" id="btnReg">
+              Rekam wajah &amp; buat dongle
+            </button>
+          </div>
+          <p class="msg" id="msgReg"></p>
+        </div>
+        <div class="card">
+          <h3>Login Pemilih (3 faktor)</h3>
+          <div class="row">
+            <button class="go alt" id="btnPickKey">
+              1. Pilih dongle .key dari flashdisk
+            </button><span
+              class="mut"
+              id="dongleName"
+            ></span>
+          </div>
+          <div class="row" style="margin-top: 8px">
+            <input
+              id="loginPin"
+              class="pw"
+              type="text"
+              inputmode="numeric"
+              maxlength="4"
+              placeholder="2. PIN"
+              autocomplete="off"
+            /><button class="go" id="btnLogin">
+              3. Pindai wajah &amp; masuk
+            </button>
+          </div>
+          <p class="msg" id="msgLogin"></p>
+        </div>
+        <div class="card">
+          <h3>Akses Panitia</h3>
+          <div class="row">
+            <button class="go alt" id="btnPickAdminKey">
+              1. Pilih dongle panitia
+            </button><span class="mut" id="adminDongleName"></span>
+          </div>
+          <div class="row" style="margin-top: 8px">
+            <input
+              id="adminKey"
+              class="pw"
+              type="text"
+              placeholder="2. Kunci panitia"
+              autocomplete="off"
+            /><button class="go" id="btnAdmin">Masuk sebagai panitia</button>
+          </div>
+          <p class="msg" id="msgAdmin"></p>
+        </div>
+      </section>
+
+      <section id="vote">
+        <h2>Surat Suara</h2>
+        <div class="card">
+          <div id="candList"></div>
+          <button class="go" id="btnVote">Kirim suara</button>
+          <p class="msg" id="msgVote"></p>
+        </div>
+      </section>
+
+      <section id="status">
+        <h2>Status Pemilih</h2>
+        <div class="card">
+          <div id="statusBox"></div>
+          <div id="statusTrace"></div>
+        </div>
+      </section>
+
+      <section id="text">
+        <h2>Tactical Command Messaging</h2>
+        <p class="mut">
+          Kanal pesan perintah terenkripsi antar-koordinator kampanye (instruksi
+          lapangan, arahan logistik, jadwal rapat tertutup).
+        </p>
+        <details class="explain" open>
+          <summary>Cara kerja super-enkripsi 3 lapis</summary>
+          <p>
+            Pesan melewati tiga lapis berurutan: Plaintext → Caesar → Rail Fence
+            → AES-256-GCM. Caesar dan Rail Fence adalah sandi klasik (edukasi,
+            mudah dipecahkan sendirian); keamanan sesungguhnya ada di
+            AES-256-GCM. Dekripsi membalik urutan: AES → Rail Fence → Caesar.
+            Tabel tiap tahap muncul setelah proses dijalankan.
+          </p>
+        </details>
+        <div class="card">
+          <textarea
+            id="txtIn"
+            placeholder="Pesan perintah (plaintext)"
+          ></textarea>
+          <div class="row" style="margin-top: 8px">
+            <label class="mut"
+              >Geser Caesar
+              <input
+                id="txtShift"
+                type="number"
+                value="7"
+                style="width: 70px" /></label
+            ><label class="mut"
+              >Rel
+              <input
+                id="txtRails"
+                type="number"
+                min="2"
+                value="4"
+                style="width: 70px" /></label
+            ><input
+              id="txtPass"
+              class="pw"
+              type="text"
+              placeholder="Kunci AES (min 6)"
+              autocomplete="off"
+            /><button class="go" id="btnTxtEnc">Enkripsi</button>
+          </div>
+          <p class="msg" id="msgTxt"></p>
+          <div id="txtTrace"></div>
+        </div>
+        <div class="card">
+          <h3>Dekripsi</h3>
+          <textarea id="txtPkg" placeholder="Paket Base64"></textarea
+          ><button class="go" id="btnTxtDec" style="margin-top: 8px">
+            Dekripsi (pakai geser, rel, kunci di atas)
+          </button>
+          <p class="msg" id="msgTxtDec"></p>
+          <div id="txtDecTrace"></div>
+        </div>
+      </section>
+
+      <section id="file">
+        <h2>Campaign Logistical Vault</h2>
+        <p class="mut">
+          Brankas dokumen logistik kampanye (anggaran, rute distribusi, daftar
+          relawan). Dienkripsi di browser, server hanya menyimpan blob .secure.
+        </p>
+        <details class="explain" open>
+          <summary>Cara kerja berkas .secure</summary>
+          <p>
+            Kata sandi + salt acak diturunkan dengan PBKDF2-SHA256 (100.000
+            iterasi) menjadi kunci RC4 (16 B) dan kunci HMAC (32 B). RC4
+            membangkitkan keystream (768 byte pertama dibuang), lalu keystream
+            di-XOR dengan data. HMAC-SHA256 dihitung atas seluruh berkas
+            (encrypt-then-MAC). Saat dekripsi, HMAC diperiksa lebih dulu: satu
+            byte saja berubah, atau kunci salah, berkas ditolak sebelum
+            didekripsi.
+          </p>
+        </details>
+        <div class="card">
+          <div class="row">
+            <input type="file" id="fileIn" /><input
+              id="filePass"
+              class="pw"
+              type="text"
+              placeholder="Kunci (min 6)"
+              autocomplete="off"
+            /><button class="go" id="btnSecEnc">Enkripsi &amp; unduh</button
+            ><button class="go alt" id="btnSecSave">Simpan ke server</button>
+          </div>
+          <p class="msg" id="msgFile"></p>
+          <div id="fileTrace"></div>
+        </div>
+        <div class="card">
+          <h3>Dekripsi</h3>
+          <div class="row">
+            <input type="file" id="secIn" accept=".secure" /><input
+              id="secPass"
+              class="pw"
+              type="text"
+              placeholder="Kunci"
+              autocomplete="off"
+            /><button class="go" id="btnSecDec">
+              Verifikasi &amp; dekripsi
+            </button>
+          </div>
+          <p class="msg" id="msgSecDec"></p>
+          <div id="decTrace"></div>
+        </div>
+        <div class="card">
+          <h3>Dokumen tersimpan di server</h3>
+          <button class="go alt" id="btnDocs">Muat daftar</button>
+          <div id="docList"></div>
+        </div>
+      </section>
+
+      <section id="stego">
+        <h2>Anti-Counterfeit Credential</h2>
+        <p class="mut">
+          Tandai poster atau kartu pemilih resmi dengan watermark tak kasatmata,
+          lalu periksa materi yang beredar untuk mendeteksi poster palsu atau
+          black campaign.
+        </p>
+        <details class="explain" open>
+          <summary>Cara kerja steganografi DCT</summary>
+          <p>
+            Gambar dibagi blok 8x8 piksel (luminans), tiap blok diubah ke domain
+            frekuensi dengan DCT. Satu bit disandikan lewat urutan dua koefisien
+            (C[3][4] dan C[4][3]) dengan selisih minimal 25, diulang 3 blok dan
+            dibaca dengan suara mayoritas agar lebih tahan kompresi JPEG. Header
+            16 bit menyimpan panjang pesan. Poster yang tidak memuat watermark
+            valid, atau kodenya berbeda, patut dicurigai sebagai tiruan.
+          </p>
+        </details>
+        <div class="card">
+          <div class="row">
+            <input type="file" id="imgIn" accept="image/*" /><button
+              class="go"
+              id="btnEmbed"
+            >
+              Tanam watermark &amp; unduh PNG</button
+            ><button class="go alt" id="btnExtract">Periksa keaslian</button>
+          </div>
+          <label
+            class="mut"
+            for="stegoMsg"
+            style="display: block; margin-top: 10px"
+            >Pesan rahasia / kode watermark (untuk ditanam, dan pembanding saat
+            pemeriksaan)</label
+          ><textarea
+            id="stegoMsg"
+            placeholder="Contoh: POSTER-RESMI-KAMPANYE-2026"
+            autocomplete="off"
+          ></textarea>
+          <label
+            class="mut"
+            for="stegoOut"
+            style="display: block; margin-top: 10px"
+            >Hasil ekstraksi pesan</label
+          ><textarea
+            id="stegoOut"
+            readonly
+            placeholder="Muncul setelah pemeriksaan"
+          ></textarea>
+          <p class="msg" id="msgStego"></p>
+        </div>
+      </section>
+
+      <section id="dash">
+        <h2>Campaign Command Dashboard</h2>
+        <details class="explain">
+          <summary>Cara kerja ledger</summary>
+          <p>
+            Suara masuk antrean sebagai hash pilihan (HMAC), tanpa identitas
+            pemilih. Saat antrean mencapai BLOCK_SIZE (atau panitia menyegel),
+            urutannya diacak dan dijadikan blok: Merkle root dari semua hash,
+            dirantai dengan hash blok sebelumnya (SHA-256). Mengubah satu isi
+            blok merusak Merkle root dan seluruh rantai sesudahnya, sehingga
+            status berubah TAMPERED.
+          </p>
+        </details>
+        <div class="card">
+          <div class="row">
+            <button class="go" id="btnDash">Muat</button
+            ><label class="mut"
+              ><input type="checkbox" id="autoDash" /> Auto-refresh 5 dtk</label
+            ><button class="go alt" id="btnSeal">Segel suara tertunda</button
+            ><button class="go alt" id="btnTamper">Tamper blok 1 (demo)</button>
+          </div>
+          <p class="msg" id="msgDash"></p>
+          <div class="stats" id="dashStat"></div>
+          <canvas id="chart" height="110" style="margin-top: 12px"></canvas>
+          <h3>Blok ledger</h3>
+          <div id="blocks"></div>
+        </div>
+      </section>
+    </main>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.js"></script>
+    <script src="/shared/layers.js"></script>
+    <script src="js/dct-stego.js"></script>
+    <script src="js/face.js"></script>
+    <script src="js/dongle.js"></script>
+    <script src="js/file-crypto.js"></script>
+    <script src="js/app.js"></script>
+  </body>
+</html>
