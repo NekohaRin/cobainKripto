@@ -10,11 +10,17 @@ const execFileAsync = promisify(execFile);
 const Layers = require("../shared/layers"),
   led = require("./ledger");
 const E = process.env;
+const BROWSER_DONGLE = E.DONGLE_MODE === "browser";
 if (
   E.NODE_ENV === "production" &&
-  ["ADMIN_KEY", "ELECTION_SECRET", "NIK_SALT", "FACE_KEY", "ADMIN_TOKEN_HASH", "ADMIN_USB_SERIAL"].some((k) => !E[k])
+  ["ADMIN_KEY", "ELECTION_SECRET", "NIK_SALT", "FACE_KEY", "ADMIN_TOKEN_HASH",
+    ...(BROWSER_DONGLE ? [] : ["ADMIN_USB_SERIAL"])].some((k) => !E[k])
 ) {
-  console.error("Isi ADMIN_KEY, ELECTION_SECRET, NIK_SALT, FACE_KEY, ADMIN_TOKEN_HASH, ADMIN_USB_SERIAL di .env");
+  console.error(
+    BROWSER_DONGLE
+      ? "Isi ADMIN_KEY, ELECTION_SECRET, NIK_SALT, FACE_KEY, ADMIN_TOKEN_HASH di environment."
+      : "Isi ADMIN_KEY, ELECTION_SECRET, NIK_SALT, FACE_KEY, ADMIN_TOKEN_HASH, ADMIN_USB_SERIAL di .env"
+  );
   process.exit(1);
 }
 const SECRET = E.ELECTION_SECRET || "dev-secret",
@@ -24,9 +30,11 @@ const LOCKOUT_SECONDS = Number(E.LOCKOUT_SECONDS) || 60;
 const PARAMS = { shift: +E.ELECTION_SHIFT || 7, rails: +E.ELECTION_RAILS || 4 };
 const pool = mysql.createPool({
   host: E.DB_HOST || "localhost",
+  port: Number(E.DB_PORT) || (E.NODE_ENV === "production" ? 4000 : 3306),
   user: E.DB_USER || "root",
   password: E.DB_PASS || "",
   database: E.DB_NAME || "evoting",
+  ssl: E.DB_SSL === "true" ? {} : undefined,
   connectionLimit: 10,
   timezone: "Z",
 });
@@ -216,7 +224,7 @@ async function findDonglesOnUsb() {
 }
 
 // Background watcher: revoke sesi voter/admin jika USB-nya dicabut.
-if (DONGLE_REQUIRED) {
+if (DONGLE_REQUIRED && !BROWSER_DONGLE) {
   setInterval(
     async () => {
       const activeSessions = Array.from(sessions.entries()).filter(
@@ -266,6 +274,10 @@ const serial = (fn) => {
 };
 
 app.disable("x-powered-by");
+app.get("/health", (_req, res) => {
+  res.status(200).json({ status: "ok", service: "evoting" });
+});
+
 app.use((_, res, next) => {
   res.set({
     "X-Content-Type-Options": "nosniff",
@@ -289,25 +301,56 @@ const sess = (req) =>
   sessions.get((req.headers.authorization || "").replace("Bearer ", ""));
 const auth = (req, res, next) => {
   // khusus pemilih
-  const t = (req.headers.authorization || "").replace("Bearer ", ""),
-    s = sessions.get(t);
-  if (!s || s.admin || s.exp < Date.now())
+  const t = (req.headers.authorization || "").replace("Bearer ", "");
+  const s = sessions.get(t);
+  if (!s || s.admin || s.exp < Date.now()) {
     return res.status(401).json({ error: "Sesi tidak valid." });
+  }
+
+  // Mode cloud: bukti dongle dikirim ulang dari browser setelah file .key dibaca.
+  if (BROWSER_DONGLE) {
+    const dongleToken = req.get("X-Dongle-Token") || "";
+    if (
+      !s.dongleHash ||
+      !/^[0-9a-f]{64}$/.test(dongleToken) ||
+      !eq(sha(dongleToken), s.dongleHash)
+    ) {
+      return res.status(401).json({ error: "Dongle pemilih tidak terbaca atau tidak sesuai." });
+    }
+  }
+
   req.voterId = s.id;
   req.sessionToken = t;
   next();
 };
 const admin = (req, res, next) => {
   const s = sess(req);
-  return s && s.admin && s.exp > Date.now()
-    ? next()
-    : res.status(401).json({ error: "Khusus panitia. Login sebagai admin." });
+  if (!s || !s.admin || s.exp <= Date.now()) {
+    return res.status(401).json({ error: "Khusus panitia. Login sebagai admin." });
+  }
+  if (BROWSER_DONGLE) {
+    const dongleToken = req.get("X-Admin-Dongle-Token") || "";
+    if (
+      !s.adminDongleHash ||
+      !/^[0-9a-f]{64}$/.test(dongleToken) ||
+      !eq(sha(dongleToken), s.adminDongleHash)
+    ) {
+      return res.status(401).json({ error: "Dongle admin tidak terbaca atau tidak sesuai." });
+    }
+  }
+  next();
 };
 
 app.get(
   "/api/usb-status",
   wrap(async (req, res) => {
     const s = sess(req);
+    if (BROWSER_DONGLE) {
+      if (s && s.exp > Date.now()) {
+        return res.json({ ok: true, role: s.admin ? "admin" : "voter" });
+      }
+      return res.json({ ok: true, role: "guest" });
+    }
     if (!DONGLE_REQUIRED) {
       // Bypass USB — kembalikan role dari sesi aktif agar polling tidak false-kick
       if (s && s.exp > Date.now()) {
@@ -351,6 +394,9 @@ app.get(
 app.get(
   "/api/dongle/detect",
   wrap(async (_req, res) => {
+    if (BROWSER_DONGLE) {
+      return res.json({ required: true, browserDongle: true, detected: [], detectedAdmin: null });
+    }
     if (!DONGLE_REQUIRED) return res.json({ required: false, detected: [], detectedAdmin: null });
     const dongles = await findDonglesOnUsb();
     const voterDongles = dongles ? dongles.filter((d) => d.role === "voter") : [];
@@ -366,6 +412,12 @@ app.get(
   ),
 );
 app.get("/api/election", (_, res) => res.json(PARAMS)); // pass AES = token sesi pemilih
+
+app.post("/api/logout", (req, res) => {
+  const token = (req.headers.authorization || "").replace("Bearer ", "");
+  if (token) sessions.delete(token);
+  res.json({ ok: true });
+});
 
 app.post(
   "/api/register",
@@ -506,7 +558,7 @@ app.post(
     );
     res.json({
       session: newSession(
-        { id: v.id, voterCode: v.voter_code, token },
+        { id: v.id, voterCode: v.voter_code, token, dongleHash: sha(token) },
         15 * 60e3,
       ),
       hasVoted: !!v.has_voted,
@@ -531,33 +583,48 @@ app.post(
       return failAdmin();
     }
 
-    // Server scan USB langsung — cari dongle-ADMIN.key yang valid
-    const dongles = await findDonglesOnUsb();
-    const adminDongle = dongles
-      ? dongles.find(
-          (d) => d.role === "admin" && eq(sha(d.token), E.ADMIN_TOKEN_HASH || ""),
-        )
-      : null;
-
-    // Cek serial USB — hanya di production; di development di-skip untuk kemudahan recovery
+    let adminToken = null;
+    let dongleOk = false;
     let serialOk = true;
-    if (E.NODE_ENV === "production" && E.ADMIN_USB_SERIAL) {
-      const usbSerials = await getUsbSerials();
-      serialOk = usbSerials.includes(E.ADMIN_USB_SERIAL.trim());
+
+    if (BROWSER_DONGLE) {
+      adminToken = typeof req.body.adminToken === "string" ? req.body.adminToken : "";
+      dongleOk =
+        /^[0-9a-f]{64}$/.test(adminToken) &&
+        eq(sha(adminToken), E.ADMIN_TOKEN_HASH || "");
+    } else {
+      // Mode desktop lama: server mendeteksi dongle admin pada USB Windows.
+      const dongles = await findDonglesOnUsb();
+      const adminDongle = dongles
+        ? dongles.find(
+            (d) => d.role === "admin" && eq(sha(d.token), E.ADMIN_TOKEN_HASH || ""),
+          )
+        : null;
+      adminToken = adminDongle?.token || null;
+      dongleOk = !!adminDongle;
+
+      if (E.NODE_ENV === "production" && E.ADMIN_USB_SERIAL) {
+        const usbSerials = await getUsbSerials();
+        serialOk = usbSerials.includes(E.ADMIN_USB_SERIAL.trim());
+      }
     }
 
     const keyOk = eq(sha(req.body.key), sha(ADMIN_KEY));
 
-    if (!adminDongle || !keyOk || !serialOk) {
+    if (!dongleOk || !keyOk || !serialOk) {
       if (++a.n >= 5) { a.until = Date.now() + 300e3; a.n = 0; }
       adminFails.set(req.ip, a);
-      console.warn(`[AUTH] Login admin ditolak dari ${req.ip}: dongle=${!!adminDongle}, key=${keyOk}, serial=${serialOk}`);
+      console.warn(`[AUTH] Login admin ditolak dari ${req.ip}: dongle=${dongleOk}, key=${keyOk}, serial=${serialOk}`);
       return failAdmin();
     }
 
     adminFails.delete(req.ip);
     res.json({
-      session: newSession({ admin: true, adminToken: adminDongle.token }, 30 * 60e3),
+      session: newSession({
+        admin: true,
+        adminToken,
+        adminDongleHash: sha(adminToken)
+      }, 30 * 60e3),
     });
   }),
 );
@@ -622,7 +689,8 @@ app.post(
       await led.ensureGenesis(conn);
       const block = await led.sealIfReady(conn, BLOCK);
       await conn.commit();
-      sessions.delete(req.sessionToken);
+      // Sesi tetap hidup agar pemilih dapat melihat halaman status setelah vote.
+      // Pencegahan vote kedua tetap dijamin oleh voters.has_voted di transaksi.
       res.json({ ok: true, sealedBlock: block });
     } catch (e) {
       await conn.rollback();
@@ -750,6 +818,7 @@ app.use((err, _req, res, _next) =>
   res.status(400).json({ error: "Permintaan tidak valid." }),
 );
 
-app.listen(E.PORT || 3000, () =>
-  console.log("E-Voting server di http://localhost:" + (E.PORT || 3000)),
+const PORT = Number(E.PORT) || 3000;
+app.listen(PORT, "0.0.0.0", () =>
+  console.log("E-Voting server berjalan pada port " + PORT),
 );

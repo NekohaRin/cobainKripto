@@ -1,8 +1,11 @@
 // Orkestrator UI: peran Pemilih vs Panitia, login 3FA, voting, super-enkripsi, file vault, DCT, dashboard.
 const $ = id => document.getElementById(id);
-const S = { session: null, role: null, voter: null, nik: '', voted: false, votedAt: null, block: null, params: null, idle: null };
+const S = { session: null, role: null, voter: null, nik: '', voted: false, votedAt: null, block: null, params: null, idle: null, dongleHandle: null, dongleCode: null, adminDongleHandle: null };
 let chart, dashTimer, lastSecure = null;
-let detectedDongle = null;     // dongle voter yang terdeteksi dari USB
+let detectedDongle = null;     // dongle voter yang dipilih dari USB melalui browser
+let selectedAdminDongle = null;
+let dongleWatchTimer = null;
+let dongleWatchBusy = false;
 let usbScanTimer = null;       // polling auto-detect USB saat di halaman gate
 let _lockTimer = null;         // timer countdown blokir akun
 let _lockRemaining = 0;        // sisa detik blokir (dipakai saat re-show modal)
@@ -19,6 +22,22 @@ const loadImg = f => new Promise((res, rej) => { const u = URL.createObjectURL(f
 async function api(path, { method = 'GET', body, headers = {}, raw } = {}) {
   const h = { ...headers };
   if (S.session) h.Authorization = 'Bearer ' + S.session;
+
+  // Pada mode browser dongle, baca ulang file fisik sebelum setiap request
+  // yang membutuhkan sesi voter/admin. Token tidak disimpan di localStorage.
+  if (S.session && S.role === 'voter') {
+    if (!S.dongleHandle) throw new Error('Dongle pemilih belum terhubung.');
+    const d = await readDongleHandle(S.dongleHandle, 'voter');
+    if (d.rec.voterCode !== S.dongleCode) {
+      throw new Error('Dongle tidak cocok dengan sesi pemilih.');
+    }
+    h['X-Dongle-Token'] = d.rec.token;
+  } else if (S.session && S.role === 'admin') {
+    if (!S.adminDongleHandle) throw new Error('Dongle admin belum terhubung.');
+    const d = await readDongleHandle(S.adminDongleHandle, 'admin');
+    h['X-Admin-Dongle-Token'] = d.rec.token;
+  }
+
   if (body && !raw) h['Content-Type'] = 'application/json';
   const r = await fetch(path, { method, headers: h, body: body && (raw ? body : JSON.stringify(body)) });
   if (r.status === 401 && S.session) lock('Sesi tidak valid. Silakan login ulang.');
@@ -108,10 +127,11 @@ function clearWork() {
 }
 function lock(reason, ok = false) {
   clearTimeout(S.idle); stopCamera($('cam'));
+  stopDongleWatch();
   window.__CURRENT_VOTER_SESSION = null;
   detectedDongle = null;
   clearInterval(usbScanTimer); usbScanTimer = null;
-  Object.assign(S, { session: null, role: null, voter: null, nik: '', voted: false, votedAt: null, block: null, params: null, idle: null });
+  Object.assign(S, { session: null, role: null, voter: null, nik: '', voted: false, votedAt: null, block: null, params: null, idle: null, dongleHandle: null, dongleCode: null, adminDongleHandle: null });
   clearWork(); resetGate(); $('acct').textContent = 'Belum login'; $('btnLogout').hidden = true; refreshNav(); show('gate');
   if (reason) say('msgLogin', reason, ok);
   // Mulai polling USB kembali setelah lock (untuk tampilkan dongle bila ada)
@@ -119,76 +139,127 @@ function lock(reason, ok = false) {
 }
 function armIdle() { clearTimeout(S.idle); S.idle = setTimeout(() => S.session && lock('Tidak ada aktivitas 5 menit. Dikunci otomatis.'), 300000); }
 ['pointerdown', 'keydown'].forEach(e => document.addEventListener(e, () => S.session && armIdle()));
-document.addEventListener('click', e => { if (e.target.closest('[data-logout]')) lock('Anda telah keluar.', true); });
+document.addEventListener('click', e => {
+  if (e.target.closest('[data-logout]')) {
+    const token = S.session;
+    if (token) {
+      fetch('/api/logout', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + token },
+        cache: 'no-store'
+      }).catch(() => {});
+    }
+    lock('Anda telah keluar.', true);
+  }
+});
 window.addEventListener('pageshow', e => { if (e.persisted) lock(''); });
 const updateAcct = () => { $('acct').textContent = S.role === 'admin' ? 'Panitia (Admin)' : `NIK ${S.nik} · ${S.voter} · ${S.voted ? 'Sudah memilih' : 'Belum memilih'}`; };
 function startSession() { resetGate(); stopCamera($('cam')); $('btnLogout').hidden = false; updateAcct(); refreshNav(); armIdle(); }
 
-// ----- USB Dongle auto-detect -----
+// ----- Browser USB dongle (File System Access API) -----
 async function scanUsbDongle() {
   const statusEl = $('usbStatusText');
   const iconEl = $('usbIcon');
   const loginBtn = $('btnLogin');
-  if (!statusEl) return; // bukan di halaman gate
+  if (!statusEl || detectedDongle) return;
+
   try {
-    const data = await api('/api/dongle/detect');
-    if (!data.required) {
-      // Dev mode: DONGLE_REQUIRED=false — bypass USB, voterCode diisi user manual
-      iconEl.textContent = '⚠️';
-      statusEl.textContent = 'Dev Mode: USB tidak diwajibkan. Isi Kode Pemilih manual.';
-      if (!_lockTimer) loginBtn.disabled = false;
-      // Tampilkan input kode pemilih manual (tersembunyi di mode normal)
-      const devRow = $('devVoterCodeRow');
-      if (devRow) devRow.style.display = '';
-      // Sync detectedDongle setiap kali user ketik di input
-      window.__devDongleUpdate = (val) => {
-        detectedDongle = { voterCode: val.trim() || null, token: null, nikMask: null };
-      };
-      const manualCode = $('loginVoterCode') ? $('loginVoterCode').value.trim() : null;
-      detectedDongle = { voterCode: manualCode || null, token: null, nikMask: null };
-      // Update indikator admin juga
-      const adminUsbEl = $('adminUsbStatus');
-      if (adminUsbEl) adminUsbEl.textContent = 'Dev Mode — dongle admin tidak diwajibkan.';
+    const handle = await restoreDongleHandle('voter');
+    if (!handle) {
+      statusEl.textContent = 'Klik Hubungkan Dongle, lalu pilih file .key pada flashdisk.';
+      if (iconEl) iconEl.textContent = '🔌';
+      if (loginBtn) loginBtn.disabled = true;
       return;
     }
-    // Mode normal — sembunyikan input dev jika ada
-    const devRow = $('devVoterCodeRow');
-    if (devRow) devRow.style.display = 'none';
-    window.__devDongleUpdate = null;
-    // Voter dongle
-    if (data.detected && data.detected.length > 0) {
-      detectedDongle = data.detected[0];
-      iconEl.textContent = '';
-      statusEl.innerHTML = `Terdeteksi: <b>${esc(detectedDongle.voterCode)}</b> di Drive <b>${esc(detectedDongle.driveLetter)}</b>`;
-      if (!_lockTimer) loginBtn.disabled = false;
-    } else {
-      detectedDongle = null;
-      iconEl.textContent = '';
-      statusEl.textContent = 'Menunggu USB Dongle dicolokkan...';
-      loginBtn.disabled = true;
-    }
-    // Admin dongle
-    const adminUsbEl = $('adminUsbStatus');
-    if (adminUsbEl) {
-      if (data.detectedAdmin) {
-        adminUsbEl.innerHTML = '<span style="color:#4ade80">&#10003; dongle-ADMIN.key terdeteksi</span>';
-      } else {
-        adminUsbEl.innerHTML = '<span style="color:#f87171">Menunggu dongle-ADMIN.key...</span>';
-      }
-    }
-  } catch (_) {
-    // Server tidak dapat menjawab — jangan crash UI
+
+    const d = await readDongleHandle(handle, 'voter');
+    detectedDongle = {
+      voterCode: d.rec.voterCode,
+      token: d.rec.token,
+      nikMask: d.rec.nikMask || null,
+      handle
+    };
+    statusEl.textContent = `Dongle siap: ${d.rec.voterCode}`;
+    if (iconEl) iconEl.textContent = '✓';
+    if (loginBtn && !_lockTimer) loginBtn.disabled = false;
+  } catch (err) {
+    statusEl.textContent = 'Dongle tersimpan, tetapi tidak dapat dibaca. Hubungkan ulang.';
+    if (iconEl) iconEl.textContent = '⚠️';
+    if (loginBtn) loginBtn.disabled = true;
   }
 }
-function startUsbPolling() {
-  clearInterval(usbScanTimer);
-  scanUsbDongle(); // langsung scan pertama
-  usbScanTimer = setInterval(scanUsbDongle, 2500);
+
+async function connectVoterDongle() {
+  const handle = await pickDongleHandle('voter');
+  const d = await readDongleHandle(handle, 'voter');
+  detectedDongle = {
+    voterCode: d.rec.voterCode,
+    token: d.rec.token,
+    nikMask: d.rec.nikMask || null,
+    handle
+  };
+  $('usbStatusText').textContent = `Dongle terhubung: ${d.rec.voterCode}`;
+  $('usbIcon').textContent = '✓';
+  $('btnLogin').disabled = !!_lockTimer;
+  toast(`Dongle ${d.rec.voterCode} berhasil dibaca.`);
 }
 
+async function connectAdminDongle() {
+  const handle = await pickDongleHandle('admin');
+  const d = await readDongleHandle(handle, 'admin');
+  selectedAdminDongle = { handle, token: d.rec.token };
+  $('adminUsbStatus').textContent = '✓ Dongle admin berhasil dibaca.';
+  toast('Dongle admin berhasil dihubungkan.');
+}
+
+function startUsbPolling() {
+  clearInterval(usbScanTimer);
+  scanUsbDongle();
+  usbScanTimer = setInterval(scanUsbDongle, 3000);
+}
+
+function stopDongleWatch() {
+  if (dongleWatchTimer) clearInterval(dongleWatchTimer);
+  dongleWatchTimer = null;
+  dongleWatchBusy = false;
+}
+
+function startDongleWatch() {
+  stopDongleWatch();
+  if (!S.session || !['voter', 'admin'].includes(S.role)) return;
+
+  dongleWatchTimer = setInterval(async () => {
+    if (dongleWatchBusy || !S.session) return;
+    dongleWatchBusy = true;
+    try {
+      if (S.role === 'voter') {
+        const d = await readDongleHandle(S.dongleHandle, 'voter');
+        if (d.rec.voterCode !== S.dongleCode) {
+          throw new Error('Identitas dongle berubah.');
+        }
+      } else {
+        await readDongleHandle(S.adminDongleHandle, 'admin');
+      }
+    } catch (err) {
+      const token = S.session;
+      stopDongleWatch();
+      try {
+        await fetch('/api/logout', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + token },
+          cache: 'no-store'
+        });
+      } catch (_) {}
+      lock('Dongle dilepas atau tidak dapat dibaca. Sesi telah dikunci.');
+    } finally {
+      dongleWatchBusy = false;
+    }
+  }, 3000);
+}
 // ----- Gatekeeper -----
 $('btnCam').onclick = guard('msgLogin', async () => { await startCamera($('cam'), t => say('msgLogin', t)); });
-$('btnScanUsb').onclick = () => scanUsbDongle();
+$('btnScanUsb').onclick = guard('msgLogin', async () => { await connectVoterDongle(); });
+$('btnAdminDongle').onclick = guard('msgAdmin', async () => { await connectAdminDongle(); });
 $('btnReg').onclick = guard('msgReg', async () => {
   const nik = $('regNik').value.trim(), pin = $('regPin').value;
   if (!/^\d{16}$/.test(nik) || !/^\d{4}$/.test(pin)) throw new Error('NIK harus 16 digit dan PIN 4 digit.');
@@ -201,34 +272,74 @@ $('btnReg').onclick = guard('msgReg', async () => {
 });
 $('btnLogin').onclick = async () => {
   try {
-    if (!detectedDongle || !detectedDongle.voterCode) throw new Error('Colokkan flashdisk USB yang berisi berkas dongle .key.');
+    if (!detectedDongle || !detectedDongle.voterCode || !detectedDongle.handle) {
+      throw new Error('Hubungkan flashdisk dan pilih file dongle .key terlebih dahulu.');
+    }
+    // Baca ulang file fisik tepat sebelum autentikasi.
+    const currentDongle = await readDongleHandle(detectedDongle.handle, 'voter');
     const pin = $('loginPin').value;
     if (!/^\d{4}$/.test(pin)) throw new Error('PIN harus 4 digit.');
     const descriptor = await scan('msgLogin', 4);
-    const r = await api('/api/login', { method: 'POST', body: { voterCode: detectedDongle.voterCode, pin, token: detectedDongle.token, descriptor } });
-    // Simpan session di window agar polling USB status tahu siapa yang login
+    const r = await api('/api/login', {
+      method: 'POST',
+      body: {
+        voterCode: currentDongle.rec.voterCode,
+        pin,
+        token: currentDongle.rec.token,
+        descriptor
+      }
+    });
+
     window.__CURRENT_VOTER_SESSION = r.session;
-    Object.assign(S, { session: r.session, role: 'voter', voter: detectedDongle.voterCode, nik: detectedDongle.nikMask || '(disamarkan)', voted: r.hasVoted });
+    Object.assign(S, {
+      session: r.session,
+      role: 'voter',
+      voter: currentDongle.rec.voterCode,
+      nik: currentDongle.rec.nikMask || '(disamarkan)',
+      voted: r.hasVoted,
+      dongleHandle: detectedDongle.handle,
+      dongleCode: currentDongle.rec.voterCode
+    });
+
     S.params = await api('/api/election');
-    // Hentikan polling gate, mulai guard sesi
     clearInterval(usbScanTimer); usbScanTimer = null;
-    startSession(); renderStatus(); toast('Login 3 faktor berhasil.');
-    if (S.voted) show('status'); else { await loadCandidates(); show('vote'); }
+    startSession();
+    startDongleWatch();
+    renderStatus();
+    toast('Login 3 faktor berhasil.');
+    if (S.voted) show('status');
+    else { await loadCandidates(); show('vote'); }
   } catch (e) {
     if (e.retryAfterSeconds) {
       showLockModal(e.retryAfterSeconds);
       return;
     }
     const m = e.message || String(e);
-    say('msgLogin', m, false); toast(m, false);
+    say('msgLogin', m, false);
+    toast(m, false);
   }
 };
 $('btnAdmin').onclick = guard('msgAdmin', async () => {
-  const key = $('adminKey').value; if (!key) throw new Error('Isi kunci panitia.');
-  const r = await api('/api/admin/login', { method: 'POST', body: { key } });
-  // Simpan session agar polling USB status mencakup sesi admin
+  const key = $('adminKey').value;
+  if (!key) throw new Error('Isi kunci panitia.');
+  if (!selectedAdminDongle?.handle) {
+    throw new Error('Hubungkan dongle-ADMIN.key terlebih dahulu.');
+  }
+  const d = await readDongleHandle(selectedAdminDongle.handle, 'admin');
+  const r = await api('/api/admin/login', {
+    method: 'POST',
+    body: { key, adminToken: d.rec.token }
+  });
   window.__CURRENT_VOTER_SESSION = r.session;
-  Object.assign(S, { session: r.session, role: 'admin' }); startSession(); toast('Login panitia berhasil.'); show('dash');
+  Object.assign(S, {
+    session: r.session,
+    role: 'admin',
+    adminDongleHandle: selectedAdminDongle.handle
+  });
+  startSession();
+  startDongleWatch();
+  toast('Login panitia berhasil.');
+  show('dash');
 });
 
 // ----- penjelasan algoritma + tabel bertahap -----
@@ -361,4 +472,19 @@ $('autoDash').onchange = () => { clearInterval(dashTimer); if ($('autoDash').che
 $('btnSeal').onclick = guard('msgDash', async () => { const r = await api('/api/admin/seal', { method: 'POST' }); await refreshDash(); toast(r.sealedBlock != null ? `Blok #${r.sealedBlock} tersegel.` : 'Tidak ada suara tertunda.'); });
 $('btnTamper').onclick = guard('msgDash', async () => { await api('/api/admin/tamper', { method: 'POST', body: { idx: 1 } }); await refreshDash(); toast('Blok 1 dirusak (demo). Lihat status rantai.', false); });
 
-document.addEventListener('DOMContentLoaded', () => lock(''));
+document.addEventListener('DOMContentLoaded', () => {
+  lock('');
+  restoreDongleHandle('voter').then(handle => {
+    if (handle) scanUsbDongle();
+  }).catch(() => {});
+  restoreDongleHandle('admin').then(async handle => {
+    if (!handle) return;
+    try {
+      const d = await readDongleHandle(handle, 'admin');
+      selectedAdminDongle = { handle, token: d.rec.token };
+      if ($('adminUsbStatus')) $('adminUsbStatus').textContent = 'Dongle admin tersimpan dan siap digunakan.';
+    } catch (_) {
+      if ($('adminUsbStatus')) $('adminUsbStatus').textContent = 'Dongle admin tersimpan; klik Hubungkan ulang untuk memberi izin.';
+    }
+  }).catch(() => {});
+});

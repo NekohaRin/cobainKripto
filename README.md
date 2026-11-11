@@ -168,3 +168,8 @@ Dekripsi membalik urutan: AES → Rail Fence → Caesar. Setiap tahap ditampilka
 - Dengan jumlah pemilih kecil, blok kecil dapat membuka pilihan lewat korelasi dengan data lain. Naikkan `BLOCK_SIZE`.
 - Caesar dan Rail Fence adalah sandi klasik dan mudah dipecahkan. Keamanan utama ada pada AES-256-GCM.
 - Dongle `.key` harus disimpan di USB Flashdisk oleh pemilih. Jika file dicopy ke perangkat lain tanpa sepengetahuan pemilik, keamanan bergantung pada faktor PIN dan wajah.
+
+
+## Deployment Railway + TiDB Cloud
+
+Lihat `RAILWAY-DONGLE-BROWSER.md` untuk konfigurasi cloud dan penggunaan dongle melalui browser.

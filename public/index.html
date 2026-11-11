@@ -82,16 +82,16 @@
           <p class="msg" id="msgReg"></p>
         </div>
         <div class="card">
-          <h3>Login Pemilih (3 faktor - Otomatis dari USB)</h3>
+          <h3>Login Pemilih (3 faktor - Dongle USB)</h3>
           <div class="row" style="align-items: center; gap: 10px">
             <div
               id="usbIndicator"
               style="padding: 8px 12px; border-radius: 6px; background: #1e293b; border: 1px solid #334155; flex-grow: 1; font-size: 0.95em"
             >
               <span id="usbIcon"></span>
-              <span id="usbStatusText">Mencari USB Dongle...</span>
+              <span id="usbStatusText">Hubungkan flashdisk untuk membaca dongle .key.</span>
             </div>
-            <button class="go alt" id="btnScanUsb" type="button" style="white-space: nowrap">Periksa USB</button>
+            <button class="go alt" id="btnScanUsb" type="button" style="white-space: nowrap">Hubungkan Dongle</button>
           </div>
           <div class="row" id="devVoterCodeRow" style="margin-top:8px;display:none">
             <input
@@ -121,7 +121,10 @@
         </div>
         <div class="card">
           <h3>Akses Panitia</h3>
-          <p class="mut" id="adminUsbStatus" style="font-size:13px;margin-bottom:8px">Mencari dongle-ADMIN.key...</p>
+          <p class="mut" id="adminUsbStatus" style="font-size:13px;margin-bottom:8px">Dongle admin belum dihubungkan.</p>
+          <div class="row" style="margin-bottom:8px">
+            <button class="go alt" id="btnAdminDongle" type="button">Hubungkan Dongle Admin</button>
+          </div>
           <div class="row">
             <input
               id="adminKey"
